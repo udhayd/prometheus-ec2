@@ -6,7 +6,7 @@
 PREQUISITES : aws cli to be installed (Or) please execute below steps from aws cloud shell .
 
 ## To download the script
-
+$ git clone https://github.com/udhayd/prometheus-ec2.git
 $ cd prometheus-ec2/
 
 ## To Create the Stack
