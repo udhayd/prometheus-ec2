@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SaltStack Instances Creation
+
+Parameters:
+  ImageId:
+    Description: AMI Id
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Mappings: 
+  MInstanceMap: 
+    Instancetype: 
+      dev: "t2.small"
+      test: "t2.small"
+      uat: "t2.small"
+      prod: "t2.small"
+  WInstanceMap: 
+    Instancetype: 
+      dev: "t2.micro"
+      test: "t2.micro"
+      uat: "t2.micro"
+      prod: "t2.micro"
+
+Resources:
+  Masternode:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      ImageId:
+        Ref: ImageId
+      InstanceType: !FindInMap [MInstanceMap, Instancetype, dev]
+      SecurityGroupIds:
+        - Ref: SecurityGroup
+      SubnetId:
+        Fn::ImportValue: PublicSubnet1ID
+      Tags:
+        - Key: Name
+          Value: master
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -x
+            exec >/root/bootstrap.log 2>&1
+            hostname master
+            echo "master"  >/etc/hostname
+            yum install ksh telnet -y
+            #### Prometheus Installation
+            cd /root
+            wget https://github.com/prometheus/prometheus/releases/download/v2.28.1/prometheus-2.28.1.linux-amd64.tar.gz
+            tar -xzf prometheus-2.28.1.linux-amd64.tar.gz;rm *.gz;
+            useradd -s /usr/bin/false prometheus
+            chown prometheus:prometheus prometheus-2.28.1.linux-amd64 -R
+            mv prometheus-2.28.1.linux-amd64 /opt/prometheus.linux-amd64
+            cat >/etc/systemd/system/prometheus.service <<EOF
+            [Unit]
+            Description=Prometheus Server
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            User=prometheus
+            Group=prometheus
+            Type=simple
+            ExecStart=/opt/prometheus.linux-amd64/prometheus \
+            --config.file=/opt/prometheus.linux-amd64/prometheus.yml \
+            --storage.tsdb.path=/opt/prometheus.linux-amd64/ \
+            --web.console.templates=/opt/centos/prometheus.linux-amd64/consoles \
+            --web.console.libraries=/opt/prometheus.linux-amd64/console_libraries
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl start prometheus.service
+            systemctl enable prometheus.service
+            systemctl status prometheus.service -l
+            ####Grafana Installation
+            cat >/etc/yum.repos.d/grafana.repo <<EOF
+            [grafana]
+            name=grafana
+            baseurl=https://packages.grafana.com/oss/rpm
+            repo_gpgcheck=1
+            enabled=1
+            gpgcheck=1
+            gpgkey=https://packages.grafana.com/gpg.key
+            sslverify=1
+            sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+            EOF
+            yum install grafana -y
+            systemctl start grafana-server
+            systemctl enable grafana-server
+            systemctl status grafana-server
+            ####NodeExporter Installation
+            wget https://github.com/prometheus/node_exporter/releases/download/v1.2.0/node_exporter-1.2.0.linux-amd64.tar.gz
+            tar -xzf node_exporter*.gz;rm *.gz
+            mv node_exporter* /opt/node_exporter.linux-amd64
+            chown -R prometheus:prometheus /opt/node_exporter*
+            cat >/etc/systemd/system/node_exporter.service <<EOF
+            [Unit]
+            Description=node_exporter
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            User=prometheus
+            Group=prometheus
+            Type=simple
+            ExecStart=/opt/node_exporter.linux-amd64/node_exporter
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl start node_exporter
+            systemctl enable node_exporter
+            systemctl status node_exporter
+            ####Configure Node exporter target
+            echo "
+              - job_name: 'node_exporter'
+                static_configs:
+                - targets: ['localhost:9100']
+                - targets: ['minion1:9100']
+                - targets: ['minion2:9100']" >>/opt/prometheus.linux-amd64/prometheus.yml
+            echo "00 23 * * * /usr/sbin/poweroff" >>/var/spool/cron/root;systemctl restart crond
+            D=$(date +%Y-%m-%d)
+            AZ=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null)
+            AWS_DEFAULT_REGION=$(echo $AZ| sed 's/.$//g')
+            export AWS_DEFAULT_REGION
+            aws ec2 describe-instances --query 'Reservations[*].Instances[*].[PrivateIpAddress,Tags[?Key==`Name`].Value|[0],LaunchTime,State.Name]' --output text|column -t|grep $D|grep running>/tmp/$$
+            cat /tmp/$$|awk '{print $1, " " , $2}' >>/etc/hosts
+            systemctl stop prometheus.service
+            systemctl start prometheus.service
+            echo "00 23 * * * /usr/sbin/poweroff" >>/var/spool/cron/root;systemctl restart crond
+            echo "End of Task"
+
+
+  Minion1:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      ImageId:
+        Ref: ImageId
+      InstanceType: !FindInMap [WInstanceMap, Instancetype, dev]
+      SecurityGroupIds:
+        - Ref: SecurityGroup
+      SubnetId:
+        Fn::ImportValue: PublicSubnet1ID
+      Tags:
+        - Key: Name
+          Value: minion1 
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -x
+            exec >/root/bootstrap.log 2>&1 
+            hostname minion1 
+            echo "minion1"  >/etc/hostname
+            yum install ksh telnet -y
+            ####NodeExporter Installation
+            cd /root
+            useradd -s /usr/bin/false prometheus
+            wget https://github.com/prometheus/node_exporter/releases/download/v1.2.0/node_exporter-1.2.0.linux-amd64.tar.gz
+            tar -xzf node_exporter*.gz;rm *.gz
+            mv node_exporter* /opt/node_exporter.linux-amd64
+            chown -R prometheus:prometheus /opt/node_exporter*
+            cat >/etc/systemd/system/node_exporter.service <<EOF
+            [Unit]
+            Description=node_exporter
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            User=prometheus
+            Group=prometheus
+            Type=simple
+            ExecStart=/opt/node_exporter.linux-amd64/node_exporter
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl start node_exporter
+            systemctl enable node_exporter
+            systemctl status node_exporter
+            echo "00 23 * * * /usr/sbin/poweroff" >>/var/spool/cron/root;systemctl restart crond
+            echo "End of Task"
+
+  Minion2:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      ImageId:
+        Ref: ImageId
+      InstanceType: !FindInMap [WInstanceMap, Instancetype, dev]
+      SecurityGroupIds:
+        - Ref: SecurityGroup
+      SubnetId:
+        Fn::ImportValue: PublicSubnet1ID
+      Tags:
+        - Key: Name
+          Value: minion2 
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -x
+            exec >/root/bootstrap.log 2>&1
+            hostname minion2 
+            echo "minion2"  >/etc/hostname
+            yum install ksh telnet -y
+            ####NodeExporter Installation
+            cd /root
+            useradd -s /usr/bin/false prometheus
+            wget https://github.com/prometheus/node_exporter/releases/download/v1.2.0/node_exporter-1.2.0.linux-amd64.tar.gz
+            tar -xzf node_exporter*.gz;rm *.gz
+            mv node_exporter* /opt/node_exporter.linux-amd64
+            chown -R prometheus:prometheus /opt/node_exporter*
+            cat >/etc/systemd/system/node_exporter.service <<EOF
+            [Unit]
+            Description=node_exporter
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            User=prometheus
+            Group=prometheus
+            Type=simple
+            ExecStart=/opt/node_exporter.linux-amd64/node_exporter
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl start node_exporter
+            systemctl enable node_exporter
+            systemctl status node_exporter
+            echo "00 23 * * * /usr/sbin/poweroff" >>/var/spool/cron/root;systemctl restart crond
+            echo "End of Task"
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName:
+        Fn::Sub: "${AWS::StackName}-SG"
+      GroupDescription:
+        Fn::Sub: "${AWS::StackName} SG"
+      VpcId:
+        Fn::ImportValue: MyVPCID
+      SecurityGroupIngress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+
+  SGIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !GetAtt SecurityGroup.GroupId
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: InstanceRole
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
